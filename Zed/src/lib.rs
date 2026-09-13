@@ -1,8 +1,8 @@
 mod debugger;
+mod dotnet;
+mod github;
 mod utils;
-mod vsx_handler;
 
-use std::fs;
 use zed::serde_json;
 use zed_extension_api::settings::LspSettings;
 use zed_extension_api::{
@@ -11,46 +11,56 @@ use zed_extension_api::{
 };
 
 pub(crate) const ROOT_DIR: &str = "./bin";
+pub(crate) const GITHUB_REPO: &str = "JaneySprings/DotRush";
+
+const LANGUAGE_SERVER_MODULE: &str = "LanguageServer";
+const LANGUAGE_SERVER_DLL: &str = "DotRush.dll";
 
 struct DotRushExtension {}
 impl DotRushExtension {
-    fn language_server_binary(&mut self, language_server_id: &LanguageServerId) -> Result<String> {
-        let (platform, arch) = zed::current_platform();
+    /// Returns the absolute path to `DotRush.dll`.
+    ///
+    /// The language server is a framework-dependent build without an app host,
+    /// so it is shipped as a single universal `DotRush.Bundle.LanguageServer.zip`
+    /// asset and started with `dotnet DotRush.dll`.
+    fn language_server_dll(&mut self, language_server_id: &LanguageServerId) -> Result<String> {
+        let install_dir = format!("{ROOT_DIR}/{LANGUAGE_SERVER_MODULE}");
+        let dll_path = format!("{install_dir}/{LANGUAGE_SERVER_DLL}");
 
-        let binary_path = match platform {
-            zed::Os::Windows => "./bin/LanguageServer/DotRush.exe",
-            _ => "./bin/LanguageServer/DotRush",
-        }
-        .to_string();
+        if !utils::is_file(&dll_path) {
+            zed::set_language_server_installation_status(
+                language_server_id,
+                &zed::LanguageServerInstallationStatus::Downloading,
+            );
 
-        if fs::metadata(&binary_path).map_or(false, |stat| stat.is_file()) {
-            return Ok(binary_path);
-        }
+            let downloaded = github::download_bundle(LANGUAGE_SERVER_MODULE, &install_dir)
+                .and_then(|_| {
+                    if utils::is_file(&dll_path) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "{LANGUAGE_SERVER_DLL} not found after extracting the language server bundle"
+                        ))
+                    }
+                });
 
-        let vsx_info = vsx_handler::fetch_vsx_info()?;
-
-        let target_arch = format!(
-            "{os}-{arch}",
-            os = match platform {
-                zed::Os::Mac => "darwin",
-                zed::Os::Linux => "linux",
-                zed::Os::Windows => "win32",
-            },
-            arch = match arch {
-                zed::Architecture::Aarch64 => "arm64",
-                zed::Architecture::X8664 => "x64",
-                zed::Architecture::X86 => todo!(),
+            if let Err(error) = downloaded {
+                zed::set_language_server_installation_status(
+                    language_server_id,
+                    &zed::LanguageServerInstallationStatus::Failed(error.clone()),
+                );
+                return Err(error);
             }
-        );
+        }
 
         zed::set_language_server_installation_status(
             language_server_id,
-            &zed::LanguageServerInstallationStatus::Downloading,
+            &zed::LanguageServerInstallationStatus::None,
         );
 
-        vsx_handler::download_vsx(vsx_info, &target_arch)?;
-
-        Ok(binary_path)
+        utils::get_absolute_path(&dll_path)
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|e| format!("Cannot resolve {LANGUAGE_SERVER_DLL} path: {e}"))
     }
 }
 
@@ -62,13 +72,15 @@ impl zed::Extension for DotRushExtension {
     fn language_server_command(
         &mut self,
         language_server_id: &zed::LanguageServerId,
-        _worktree: &Worktree,
+        worktree: &Worktree,
     ) -> Result<zed::Command> {
-        let dotrush_executable = self.language_server_binary(language_server_id)?;
+        // Resolve `dotnet` first: without a runtime there is no point in downloading the server.
+        let dotnet = dotnet::find(worktree)?;
+        let dll_path = self.language_server_dll(language_server_id)?;
 
         Ok(zed::Command {
-            command: dotrush_executable,
-            args: Default::default(),
+            command: dotnet,
+            args: vec![dll_path],
             env: Default::default(),
         })
     }

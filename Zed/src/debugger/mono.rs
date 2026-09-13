@@ -2,14 +2,16 @@ mod types;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use types::DebuggerOptions;
 use zed_extension_api::{
     self as zed, serde_json, AttachRequest, DebugAdapterBinary, DebugConfig, DebugRequest,
     DebugScenario, DebugTaskDefinition, StartDebuggingRequestArguments, Worktree,
 };
 
-use crate::{debugger::get_binary_abs_common};
+use crate::{dotnet, github, utils, ROOT_DIR};
+
+const MODULE_DIR: &str = "DebuggerMono";
+const DLL_NAME: &str = "monodbg.dll";
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -63,16 +65,34 @@ impl MonoDebugConfig {
     }
 }
 
+/// Returns the absolute path to `monodbg.dll`, downloading the
+/// `DotRush.Bundle.DebuggerMono.zip` release asset when it is missing.
+///
+/// The debugger is a framework-dependent build started with `dotnet monodbg.dll`.
+fn ensure_installed() -> Result<String, String> {
+    let install_dir = format!("{ROOT_DIR}/{MODULE_DIR}");
+    let dll_path = format!("{install_dir}/{DLL_NAME}");
+
+    if !utils::is_file(&dll_path) {
+        github::download_bundle(MODULE_DIR, &install_dir)?;
+
+        if !utils::is_file(&dll_path) {
+            return Err(format!("Cannot find {DLL_NAME} after download"));
+        }
+    }
+
+    utils::get_absolute_path(&dll_path)
+        .map(|path| path.to_string_lossy().to_string())
+        .map_err(|e| format!("Cannot resolve {DLL_NAME} path: {e}"))
+}
+
 pub fn get_dap_binary(
     config: DebugTaskDefinition,
     _user_provided_debug_adapter_path: Option<String>,
     worktree: &Worktree,
 ) -> zed::Result<DebugAdapterBinary, String> {
-    let binary_path = get_binary_abs_common("DebuggerMono/monodbg")?;
-
-    if !(fs::metadata(&binary_path).map_or(false, |stat| stat.is_file())) {
-        return Err("Cannot find monodbg binary".to_string());
-    }
+    let dotnet = dotnet::find(worktree)?;
+    let dll_path = ensure_installed()?;
 
     let configuration = config.config.to_string();
     let dbg_config: MonoDebugConfig =
@@ -90,8 +110,8 @@ pub fn get_dap_binary(
     };
 
     Ok(zed::DebugAdapterBinary {
-        command: Some(binary_path),
-        arguments: vec![],
+        command: Some(dotnet),
+        arguments: vec![dll_path],
         envs: dbg_config.env.into_iter().collect(),
         cwd: Some(dbg_config.cwd.unwrap_or_else(|| worktree.root_path())),
         connection: None,

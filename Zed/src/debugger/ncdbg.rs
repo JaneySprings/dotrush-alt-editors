@@ -2,13 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use zed_extension_api::{
     self as zed, serde_json, DebugAdapterBinary, DebugConfig, DebugRequest, DebugScenario,
     DebugTaskDefinition, StartDebuggingRequestArguments, Worktree,
 };
 
-use crate::{debugger::get_binary_abs_common, ROOT_DIR};
+use crate::{utils, ROOT_DIR};
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -32,9 +31,9 @@ struct NetCoreDebugConfig {
     pub process_id: Option<super::ProcessId>,
 }
 
-const REPO_SOURCE: &str = "Samsung/netcoredbg";
-const BASE_DIR: &str = "Debugger";
-const BINARY_PATH: &str = "netcoredbg/netcoredbg";
+const REPO_SOURCE: &str = "JaneySprings/clrdbg";
+const MODULE_DIR: &str = "Debugger";
+const BINARY_NAME: &str = "clrdbg";
 
 pub fn get_dap_binary(
     config: DebugTaskDefinition,
@@ -56,14 +55,11 @@ pub fn get_dap_binary(
         }
     };
 
-    let binary_path = get_binary_path(false)?;
-    let dab = zed::DebugAdapterBinary {
-        command: if fs::metadata(&binary_path).map_or(false, |stat| stat.is_file()) {
-            Some(get_binary_path(true)?)
-        } else {
-            Some(download_netcoredbg()?)
-        },
-        arguments: vec!["--interpreter=vscode".to_string()],
+    let binary_path = ensure_installed()?;
+
+    Ok(zed::DebugAdapterBinary {
+        command: Some(binary_path),
+        arguments: vec![],
         envs: dbg_config.env.into_iter().collect(),
         cwd: Some(dbg_config.cwd.unwrap_or_else(|| worktree.root_path())),
         connection: None,
@@ -71,9 +67,7 @@ pub fn get_dap_binary(
             configuration,
             request,
         },
-    };
-
-    Ok(dab)
+    })
 }
 
 pub fn dap_request_kind(
@@ -134,8 +128,60 @@ pub fn dap_config_to_scenario(
     })
 }
 
-fn download_netcoredbg() -> Result<String, String> {
-    let release = zed::latest_github_release(
+/// Returns the absolute path to the `clrdbg` executable, downloading it when missing.
+///
+/// clrdbg ships as a self-contained build per platform (`clrdbg_<os>-<arch>.zip`)
+/// with the executable at the archive root, so it runs without a `dotnet` host.
+fn ensure_installed() -> Result<String, String> {
+    let install_dir = format!("{ROOT_DIR}/{MODULE_DIR}");
+    let executable = executable_name();
+    let binary_path = format!("{install_dir}/{executable}");
+
+    if !utils::is_file(&binary_path) {
+        download_clrdbg(&install_dir)?;
+
+        if !utils::is_file(&binary_path) {
+            return Err(format!("Cannot find {executable} after download"));
+        }
+        zed::make_file_executable(&binary_path)?;
+    }
+
+    utils::get_absolute_path(&binary_path)
+        .map(|path| path.to_string_lossy().to_string())
+        .map_err(|e| format!("Cannot resolve {executable} path: {e}"))
+}
+
+fn executable_name() -> String {
+    let (platform, _) = zed::current_platform();
+    match platform {
+        zed::Os::Windows => format!("{BINARY_NAME}.exe"),
+        _ => BINARY_NAME.to_string(),
+    }
+}
+
+fn asset_name() -> Result<String, String> {
+    let (platform, arch) = zed::current_platform();
+
+    let os = match platform {
+        zed::Os::Mac => "osx",
+        zed::Os::Linux => "linux",
+        zed::Os::Windows => "win",
+    };
+    let arch = match arch {
+        zed::Architecture::Aarch64 => "arm64",
+        zed::Architecture::X8664 => "x64",
+        zed::Architecture::X86 => {
+            return Err(format!("{BINARY_NAME} is not available for 32-bit x86"));
+        }
+    };
+
+    Ok(format!("{BINARY_NAME}_{os}-{arch}.zip"))
+}
+
+fn download_clrdbg(dest_dir: &str) -> Result<(), String> {
+    let asset_name = asset_name()?;
+
+    let zed::GithubRelease { version, assets } = zed::latest_github_release(
         REPO_SOURCE,
         zed::GithubReleaseOptions {
             require_assets: true,
@@ -143,57 +189,11 @@ fn download_netcoredbg() -> Result<String, String> {
         },
     )?;
 
-    let (platform, arch) = zed::current_platform();
-
-    let asset_name = match platform {
-        zed::Os::Windows => "netcoredbg-win64.zip".to_string(),
-        os => format!(
-            "netcoredbg-{os}-{arch}.tar.gz",
-            os = match os {
-                zed::Os::Mac => "osx",
-                zed::Os::Linux => "linux",
-                _ => "unknown",
-            },
-            arch = match arch {
-                zed::Architecture::Aarch64 => "arm64",
-                zed::Architecture::X8664 => "amd64",
-                zed::Architecture::X86 => todo!(),
-            }
-        ),
-    };
-
-    let asset = release
-        .assets
+    let asset = assets
         .into_iter()
         .find(|asset| asset.name == asset_name)
-        .ok_or_else(|| format!("Asset not found: {}", asset_name))?;
+        .ok_or_else(|| format!("Asset '{asset_name}' not found in {BINARY_NAME} release {version}"))?;
 
-    zed::download_file(
-        &asset.download_url,
-        format!("{}/{}", ROOT_DIR, BASE_DIR).as_str(),
-        zed::DownloadedFileType::Zip,
-    )
-    .map_err(|e| format!("failed to download file: {e}"))?;
-
-    let binary_path = get_binary_path(false)?;
-
-    if fs::metadata(&binary_path).map_or(false, |stat| stat.is_file()) {
-        zed::make_file_executable(&binary_path)?;
-        return Ok(get_binary_path(true)?);
-    }
-
-    Err("failed to download binary".to_string())
-}
-
-fn get_binary_path(abs: bool) -> Result<String, String> {
-    let (platform, _) = zed::current_platform();
-
-    if abs {
-        return get_binary_abs_common(format!("{}/{}", BASE_DIR, BINARY_PATH).as_str());
-    }
-
-    Ok(match platform {
-        zed::Os::Windows => format!("{}/{}/{}.exe", ROOT_DIR, BASE_DIR, BINARY_PATH),
-        _ => format!("{}/{}/{}", ROOT_DIR, BASE_DIR, BINARY_PATH),
-    })
+    zed::download_file(&asset.download_url, dest_dir, zed::DownloadedFileType::Zip)
+        .map_err(|e| format!("Failed to download '{asset_name}': {e}"))
 }
